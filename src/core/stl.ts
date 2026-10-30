@@ -6,6 +6,14 @@ const MAX_POINTS = 40000;
 const MERGE_GAP = 3;
 /** 首尾距离小于该值（mm）时视为闭合轮廓。 */
 const CLOSE_EPS = 1e-3;
+/** 每层轮廓重采样后的最大点数。 */
+const RING_MAX_SAMPLES = 1024;
+/** 每层轮廓重采样后的最少点数。 */
+const RING_MIN_SAMPLES = 32;
+/** 相邻两层轮廓中心距离小于该比例半径时，认为属于同一个实体。 */
+const RUN_RADIUS_RATIO = 0.35;
+
+const TAU = Math.PI * 2;
 
 interface Chain {
   xs: number[];
@@ -15,16 +23,26 @@ interface Chain {
   closed: boolean;
 }
 
+/** 一圈水平截面轮廓，按极角升序排列。 */
+interface Ring {
+  /** 该环的代表高度（环上各点 z 的均值）。 */
+  z: number;
+  cx: number;
+  cy: number;
+  /** 平均半径，用于判断相邻环是否属于同一实体。 */
+  r: number;
+  xs: number[];
+  ys: number[];
+  angles: number[];
+}
+
 export interface StlOutput {
   buffer: ArrayBuffer;
   triangles: number;
   points: number;
 }
 
-/**
- * 把挤出路径扫掠成一条有厚度的墙带：沿路径方向计算水平法向，
- * 每点生成 外上/外下/内上/内下 四个顶点，逐段拼成封闭实体。
- */
+/** 把挤出路径按 travel 与间隙切成连续的墙体链条。 */
 function collectChains(ops: Op[]): Chain[] {
   const chains: Chain[] = [];
   let cur: Chain | null = null;
@@ -92,20 +110,26 @@ function decimate(c: Chain, stride: number): Chain {
   return { xs, ys, zs, ws, closed: c.closed };
 }
 
-/** 每点 4 个顶点：外上、外下、内上、内下，按 12 个分量存。 */
-function buildFrames(c: Chain, lh: number): Float64Array {
+/**
+ * 计算链条上每个点的外壁坐标：沿水平法向向外扩半个线宽。
+ * 法向是否朝外由该点的径向方向校正，保证轮廓整体向外扩张。
+ */
+function outwardOffset(c: Chain): { ox: number[]; oy: number[] } {
   const n = c.xs.length;
-  const out = new Float64Array(n * 12);
+  let cx = 0;
+  let cy = 0;
   for (let i = 0; i < n; i++) {
-    let a: number;
-    let b: number;
-    if (c.closed) {
-      a = (i - 1 + n) % n;
-      b = (i + 1) % n;
-    } else {
-      a = Math.max(0, i - 1);
-      b = Math.min(n - 1, i + 1);
-    }
+    cx += c.xs[i];
+    cy += c.ys[i];
+  }
+  cx /= n;
+  cy /= n;
+
+  const ox = new Array<number>(n);
+  const oy = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    const a = c.closed ? (i - 1 + n) % n : Math.max(0, i - 1);
+    const b = c.closed ? (i + 1) % n : Math.min(n - 1, i + 1);
     let tx = c.xs[b] - c.xs[a];
     let ty = c.ys[b] - c.ys[a];
     let len = Math.hypot(tx, ty);
@@ -115,37 +139,176 @@ function buildFrames(c: Chain, lh: number): Float64Array {
       ty = c.ys[j] - c.ys[i];
       len = Math.hypot(tx, ty);
     }
-    const nx = len < 1e-9 ? 1 : -ty / len;
-    const ny = len < 1e-9 ? 0 : tx / len;
+    let nx = len < 1e-9 ? 1 : -ty / len;
+    let ny = len < 1e-9 ? 0 : tx / len;
+    if (nx * (c.xs[i] - cx) + ny * (c.ys[i] - cy) < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
     const hw = Math.max(0.05, c.ws[i]) / 2;
-    const ox = c.xs[i] + nx * hw;
-    const oy = c.ys[i] + ny * hw;
-    const ix = c.xs[i] - nx * hw;
-    const iy = c.ys[i] - ny * hw;
-    const zt = c.zs[i];
-    const zb = zt - lh;
-    const o = i * 12;
-    out[o] = ox;
-    out[o + 1] = oy;
-    out[o + 2] = zt;
-    out[o + 3] = ox;
-    out[o + 4] = oy;
-    out[o + 5] = zb;
-    out[o + 6] = ix;
-    out[o + 7] = iy;
-    out[o + 8] = zt;
-    out[o + 9] = ix;
-    out[o + 10] = iy;
-    out[o + 11] = zb;
+    ox[i] = c.xs[i] + nx * hw;
+    oy[i] = c.ys[i] + ny * hw;
   }
-  return out;
+  return { ox, oy };
 }
 
-function chainTriangles(c: Chain): number {
+/** 把链条切成“每转一圈一个环”，用 z 的均值作为该环的高度。 */
+function collectRings(c: Chain, print: PrintSettings, out: Ring[]): void {
   const n = c.xs.length;
-  if (n < 2) return 0;
-  const segs = c.closed ? n : n - 1;
-  return segs * 8 + (c.closed ? 0 : 4);
+  if (n < 6) return;
+  const { ox, oy } = outwardOffset(c);
+
+  if (c.closed) {
+    pushRing(c, ox, oy, 0, n, out);
+    return;
+  }
+
+  // 以起点高度为基准按层高切分：螺旋每上升一个层高正好绕一圈，
+  // 层叠路径每个闭合同样落在一个层高区间内。
+  const lh = Math.max(0.05, print.layerHeight);
+  const z0 = c.zs[0];
+  let start = 0;
+  let bucket = 0;
+  for (let i = 1; i <= n; i++) {
+    const b = i < n ? Math.floor((c.zs[i] - z0) / lh + 1e-6) : bucket + 1;
+    if (b !== bucket) {
+      pushRing(c, ox, oy, start, i, out);
+      start = i;
+      bucket = b;
+    }
+  }
+}
+
+/** 把链条的 [i0, i1) 区间做成一个闭合环，并按极角排序。 */
+function pushRing(c: Chain, ox: number[], oy: number[], i0: number, i1: number, out: Ring[]): void {
+  const m = i1 - i0;
+  if (m < 4) return;
+
+  let cx = 0;
+  let cy = 0;
+  let z = 0;
+  for (let i = i0; i < i1; i++) {
+    cx += ox[i];
+    cy += oy[i];
+    z += c.zs[i];
+  }
+  cx /= m;
+  cy /= m;
+  z /= m;
+
+  const order: number[] = new Array(m);
+  const angles: number[] = new Array(m);
+  let r = 0;
+  for (let i = i0; i < i1; i++) {
+    const k = i - i0;
+    const dx = ox[i] - cx;
+    const dy = oy[i] - cy;
+    let a = Math.atan2(dy, dx);
+    if (a < 0) a += TAU;
+    angles[k] = a;
+    r += Math.hypot(dx, dy);
+    order[k] = k;
+  }
+  r /= m;
+  if (r < 1e-6) return;
+
+  order.sort((p, q) => angles[p] - angles[q]);
+  const xs = new Array<number>(m);
+  const ys = new Array<number>(m);
+  const ang = new Array<number>(m);
+  for (let k = 0; k < m; k++) {
+    const i = i0 + order[k];
+    xs[k] = ox[i];
+    ys[k] = oy[i];
+    ang[k] = angles[order[k]];
+  }
+  out.push({ z, cx, cy, r, xs, ys, angles: ang });
+}
+
+/** 按极角把每个环统一重采样成 n 个点，使相邻环可以逐点连接。 */
+function resampleRing(ring: Ring, n: number): void {
+  const m = ring.xs.length;
+  const src = ring.angles;
+  const sx = ring.xs;
+  const sy = ring.ys;
+  const first = src[0];
+  const xs = new Array<number>(n);
+  const ys = new Array<number>(n);
+
+  const angAt = (i: number) => (i < m ? src[i] : first + TAU);
+  const xAt = (i: number) => (i < m ? sx[i] : sx[0]);
+  const yAt = (i: number) => (i < m ? sy[i] : sy[0]);
+
+  for (let j = 0; j < n; j++) {
+    let t = (j / n) * TAU;
+    if (t < first) t += TAU;
+    let lo = 0;
+    let hi = m;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (angAt(mid) <= t) lo = mid;
+      else hi = mid - 1;
+    }
+    const i = Math.min(lo, m - 1);
+    const a0 = angAt(i);
+    const a1 = angAt(i + 1);
+    const w = a1 - a0 > 1e-12 ? (t - a0) / (a1 - a0) : 0;
+    xs[j] = xAt(i) + (xAt(i + 1) - xAt(i)) * w;
+    ys[j] = yAt(i) + (yAt(i + 1) - yAt(i)) * w;
+  }
+  ring.xs = xs;
+  ring.ys = ys;
+  ring.angles = [];
+}
+
+/** 按高度与中心位置把环分组为若干竖直“柱”，每柱是一个独立实体。 */
+function groupRuns(rings: Ring[]): Ring[][] {
+  const sorted = rings.slice().sort((a, b) => a.z - b.z);
+  const runs: Ring[][] = [];
+  for (const ring of sorted) {
+    let target: Ring[] | null = null;
+    for (const run of runs) {
+      const last = run[run.length - 1];
+      const gap = Math.hypot(ring.cx - last.cx, ring.cy - last.cy);
+      const tol = Math.max(1.5, Math.min(ring.r, last.r) * RUN_RADIUS_RATIO);
+      if (gap <= tol && ring.z > last.z + 1e-6) {
+        target = run;
+        break;
+      }
+    }
+    if (target) target.push(ring);
+    else runs.push([ring]);
+  }
+  return runs;
+}
+
+/** 把一柱环挤成实心体：逐层侧壁 + 顶面 + 底面，形成封闭实体。 */
+function emitRun(run: Ring[], layerHeight: number, w: StlWriter): void {
+  const lh = Math.max(0.05, layerHeight);
+  // 只有单圈轮廓（例如自定义脚本画了一个圆）时，向上补一个层高，做出薄片实体
+  const stack = run.length < 2 ? [run[0], { ...run[0], z: run[0].z + lh }] : run;
+  const n = stack[0].xs.length;
+
+  for (let s = 0; s + 1 < stack.length; s++) {
+    const lo = stack[s];
+    const hi = stack[s + 1];
+    for (let j = 0; j < n; j++) {
+      const k = (j + 1) % n;
+      // 外侧面，两片三角形，法向朝外
+      w.tri(lo.xs[j], lo.ys[j], lo.z, lo.xs[k], lo.ys[k], lo.z, hi.xs[k], hi.ys[k], hi.z);
+      w.tri(lo.xs[j], lo.ys[j], lo.z, hi.xs[k], hi.ys[k], hi.z, hi.xs[j], hi.ys[j], hi.z);
+    }
+  }
+
+  const base = stack[0];
+  const top = stack[stack.length - 1];
+  for (let j = 0; j < n; j++) {
+    const k = (j + 1) % n;
+    // 顶面朝上
+    w.tri(top.cx, top.cy, top.z, top.xs[j], top.ys[j], top.z, top.xs[k], top.ys[k], top.z);
+    // 底面朝下
+    w.tri(base.cx, base.cy, base.z, base.xs[k], base.ys[k], base.z, base.xs[j], base.ys[j], base.z);
+  }
 }
 
 class StlWriter {
@@ -213,57 +376,43 @@ class StlWriter {
   }
 }
 
-function emitChain(c: Chain, print: PrintSettings, w: StlWriter): void {
-  const n = c.xs.length;
-  const fr = buildFrames(c, Math.max(0.05, print.layerHeight));
-  const segs = c.closed ? n : n - 1;
-  const px = (i: number, k: number) => fr[i * 12 + k * 3];
-  const py = (i: number, k: number) => fr[i * 12 + k * 3 + 1];
-  const pz = (i: number, k: number) => fr[i * 12 + k * 3 + 2];
-
-  for (let s = 0; s < segs; s++) {
-    const i = s;
-    const j = (s + 1) % n;
-    // 外侧墙面
-    w.tri(px(i, 0), py(i, 0), pz(i, 0), px(j, 0), py(j, 0), pz(j, 0), px(j, 1), py(j, 1), pz(j, 1));
-    w.tri(px(i, 0), py(i, 0), pz(i, 0), px(j, 1), py(j, 1), pz(j, 1), px(i, 1), py(i, 1), pz(i, 1));
-    // 内侧墙面
-    w.tri(px(i, 2), py(i, 2), pz(i, 2), px(i, 3), py(i, 3), pz(i, 3), px(j, 3), py(j, 3), pz(j, 3));
-    w.tri(px(i, 2), py(i, 2), pz(i, 2), px(j, 3), py(j, 3), pz(j, 3), px(j, 2), py(j, 2), pz(j, 2));
-    // 顶面
-    w.tri(px(i, 0), py(i, 0), pz(i, 0), px(i, 2), py(i, 2), pz(i, 2), px(j, 2), py(j, 2), pz(j, 2));
-    w.tri(px(i, 0), py(i, 0), pz(i, 0), px(j, 2), py(j, 2), pz(j, 2), px(j, 0), py(j, 0), pz(j, 0));
-    // 底面
-    w.tri(px(i, 1), py(i, 1), pz(i, 1), px(j, 1), py(j, 1), pz(j, 1), px(j, 3), py(j, 3), pz(j, 3));
-    w.tri(px(i, 1), py(i, 1), pz(i, 1), px(j, 3), py(j, 3), pz(j, 3), px(i, 3), py(i, 3), pz(i, 3));
-  }
-
-  if (!c.closed) {
-    // 起止端面，保证实体封闭
-    w.tri(px(0, 0), py(0, 0), pz(0, 0), px(0, 1), py(0, 1), pz(0, 1), px(0, 3), py(0, 3), pz(0, 3));
-    w.tri(px(0, 0), py(0, 0), pz(0, 0), px(0, 3), py(0, 3), pz(0, 3), px(0, 2), py(0, 2), pz(0, 2));
-    const e = n - 1;
-    w.tri(px(e, 0), py(e, 0), pz(e, 0), px(e, 2), py(e, 2), pz(e, 2), px(e, 3), py(e, 3), pz(e, 3));
-    w.tri(px(e, 0), py(e, 0), pz(e, 0), px(e, 3), py(e, 3), pz(e, 3), px(e, 1), py(e, 1), pz(e, 1));
-  }
-}
-
-/** 由挤出路径生成可直接交给切片器的二进制 STL。坐标与 G-code 一致（打印床坐标系）。 */
+/**
+ * 由挤出路径生成可直接交给切片器的二进制 STL。坐标与 G-code 一致（打印床坐标系）。
+ * 输出为实心体：把每圈路径还原成外壁轮廓，逐层连接并封顶封底，
+ * 便于 BambuStudio 使用“旋转花瓶”模式打印。
+ */
 export function buildStl(ops: Op[], print: PrintSettings, name: string): StlOutput {
   const chains = collectChains(ops);
   if (!chains.length) throw new Error('没有可导出的几何路径');
 
   const total = chains.reduce((s, c) => s + c.xs.length, 0);
   const stride = Math.max(1, Math.ceil(total / MAX_POINTS));
-  const finalChains = chains.map((c) => decimate(c, stride));
-  const triangles = finalChains.reduce((s, c) => s + chainTriangles(c), 0);
-  if (triangles === 0) throw new Error('没有可导出的几何路径');
+  const rings: Ring[] = [];
+  for (const c of chains) collectRings(decimate(c, stride), print, rings);
+  if (!rings.length) throw new Error('没有可导出的几何路径');
 
+  const samples = Math.min(
+    RING_MAX_SAMPLES,
+    Math.max(RING_MIN_SAMPLES, rings.reduce((s, r) => Math.max(s, r.xs.length), 0)),
+  );
+  for (const r of rings) resampleRing(r, samples);
+
+  const runs = groupRuns(rings);
+  if (!runs.length) throw new Error('没有可导出的几何路径');
+
+  // 整体下移，让模型底面贴合打印床
+  const floor = runs.reduce((m, r) => Math.min(m, r[0].z), Infinity);
+  for (const run of runs) for (const ring of run) ring.z -= floor;
+
+  const triangles = runs.reduce(
+    (s, r) => s + 2 * samples * Math.max(1, r.length - 1) + 2 * samples,
+    0,
+  );
   const writer = new StlWriter(triangles, name);
-  for (const c of finalChains) emitChain(c, print, writer);
+  for (const run of runs) emitRun(run, print.layerHeight, writer);
   return {
     buffer: writer.finish(),
     triangles: writer.count,
-    points: finalChains.reduce((s, c) => s + c.xs.length, 0),
+    points: runs.reduce((s, r) => s + r.length * samples, 0),
   };
 }
